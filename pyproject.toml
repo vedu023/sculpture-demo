@@ -1,0 +1,27 @@
+[project]
+name = "sculpture-demo"
+version = "0.1.0"
+description = "Local real-time voice interaction bot demo"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "sounddevice>=0.5",
+    "numpy>=1.26",
+    "silero-vad-lite>=0.2",
+    "faster-whisper>=1.1",
+    "ollama>=0.1.0",
+    "pocket-tts>=1.1.1",
+]
+
+[project.scripts]
+voice-bot = "app.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

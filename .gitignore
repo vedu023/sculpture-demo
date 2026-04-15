@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment
+.env
+
+# Logs
+logs/*.log
+logs/*.wav
+logs/*.jsonl
+
+# Local model assets
+models/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Audio samples and voice state cache
+*.wav
+*.webm
+*.safetensors
+
+# Backup files
+*.backup
+
+# OS
+.DS_Store
+
+# Claude Code
+.claude/
