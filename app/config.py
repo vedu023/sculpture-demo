@@ -30,19 +30,21 @@ class VADConfig:
 
 @dataclass
 class ASRConfig:
-    model_name: str = "base.en"
+    model_name: str = "small.en"
     device: str = "cpu"
-    compute_type: str = "int8"
-    beam_size: int = 1
+    compute_type: str = "float32"
+    beam_size: int = 2
+    fallback_beam_size: int = 2
     language: str = "en"
     condition_on_previous_text: bool = False
 
 
 @dataclass
 class LLMConfig:
-    model_name: str = "gemma4:e4b"
-    max_tokens: int = 48
+    model_name: str = "qwen3:14b"
+    max_tokens: int = 128
     max_sentences: int = 2
+    max_history_turns: int = 10
     assistant_name: str = "Smruti"
     persona_style: str = "smruti"
 

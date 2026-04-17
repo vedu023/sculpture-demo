@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -68,10 +68,16 @@ class TurnResult:
     capture_ms: float = 0.0
     asr_ms: float = 0.0
     llm_ms: float = 0.0
+    tool_ms: float = 0.0
     tts_ms: float = 0.0
     playback_ms: float = 0.0
     total_ms: float = 0.0
     error: str | None = None
+    tool_name: str = ""
+    tool_args: dict[str, Any] = field(default_factory=dict)
+    tool_status: str = ""
+    tool_result: dict[str, Any] | None = None
+    confirmation_required: bool = False
     state_path: tuple[str, ...] = ()
 
     def to_log_dict(self) -> dict[str, Any]:
@@ -85,10 +91,16 @@ class TurnResult:
             "capture_ms": round(self.capture_ms, 1),
             "asr_ms": round(self.asr_ms, 1),
             "llm_ms": round(self.llm_ms, 1),
+            "tool_ms": round(self.tool_ms, 1),
             "tts_ms": round(self.tts_ms, 1),
             "playback_ms": round(self.playback_ms, 1),
             "total_ms": round(self.total_ms, 1),
             "error": self.error,
+            "tool_name": self.tool_name,
+            "tool_args": self.tool_args,
+            "tool_status": self.tool_status,
+            "tool_result": self.tool_result,
+            "confirmation_required": self.confirmation_required,
             "state_path": list(self.state_path),
             "utterance": self.utterance.to_log_dict() if self.utterance else None,
             "synthesized_audio": (

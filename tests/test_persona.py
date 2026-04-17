@@ -17,7 +17,7 @@ class PersonaTests(unittest.TestCase):
         config = LLMConfig()
         self.assertIn("Smruti", config.system_prompt)
         self.assertIn("warm", config.system_prompt)
-        self.assertEqual(config.max_tokens, 48)
+        self.assertEqual(config.max_tokens, 128)
 
     def test_prompt_prefers_short_spoken_sentences(self):
         config = LLMConfig()

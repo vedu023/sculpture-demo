@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from app.asr.engine import ASREngine
@@ -9,8 +10,11 @@ from app.audio.output import AudioOutput
 from app.audio.save import save_utterance
 from app.config import AppConfig
 from app.llm.engine import LLMEngine
-from app.persona import build_greeting_prompt
+from app.persona import build_greeting_prompt, build_tool_planner_prompt
 from app.state import BotState
+from app.tools.builtin import build_builtin_tool_registry
+from app.tools.executor import ToolExecutor
+from app.tools.types import ToolCall
 from app.tts.engine import TTSEngine
 from app.types import CapturedUtterance, TurnResult
 from app.utils.session_log import SessionLogger
@@ -18,6 +22,8 @@ from app.utils.text import truncate_for_log
 from app.utils.timers import Timer
 
 logger = logging.getLogger(__name__)
+_AFFIRMATIVE_RE = re.compile(r"\b(?:yes|yeah|yep|sure|okay|ok|confirm|go ahead|do it|please do)\b", re.IGNORECASE)
+_NEGATIVE_RE = re.compile(r"\b(?:no|nope|cancel|stop|do not|don't|never mind)\b", re.IGNORECASE)
 
 
 class Controller:
@@ -32,6 +38,8 @@ class Controller:
         tts: TTSEngine | None = None,
         speaker: AudioOutput | None = None,
         session_logger: SessionLogger | None = None,
+        tool_registry=None,
+        tool_executor: ToolExecutor | None = None,
     ):
         self.config = config
         self.state = BotState.LISTENING
@@ -41,6 +49,7 @@ class Controller:
             device=config.asr.device,
             compute_type=config.asr.compute_type,
             beam_size=config.asr.beam_size,
+            fallback_beam_size=config.asr.fallback_beam_size,
             language=config.asr.language,
             condition_on_previous_text=config.asr.condition_on_previous_text,
         )
@@ -49,6 +58,7 @@ class Controller:
             system_prompt=config.llm.system_prompt,
             max_tokens=config.llm.max_tokens,
             max_sentences=config.llm.max_sentences,
+            max_history_turns=config.llm.max_history_turns,
         )
         self._tts = tts or TTSEngine(
             backend=config.tts.backend,
@@ -61,9 +71,12 @@ class Controller:
             default_sample_rate=config.audio.sample_rate,
             device=config.audio.output_device,
         )
+        self._tool_registry = tool_registry or build_builtin_tool_registry(config, self._speaker)
+        self._tool_executor = tool_executor or ToolExecutor(self._tool_registry)
         self._session_logger = session_logger or SessionLogger(config.logs_dir, "chat")
         self._turn_counter = 0
         self._started = False
+        self._pending_tool_call: ToolCall | None = None
 
     def __enter__(self):
         self.start()
@@ -83,6 +96,11 @@ class Controller:
             return
         self._capture.stop()
         self._started = False
+        if hasattr(self._session_logger, "close"):
+            try:
+                self._session_logger.close()
+            except Exception:
+                logger.debug("Failed to close session logger cleanly", exc_info=True)
         logger.debug("Controller stopped after %d turn(s)", self._turn_counter)
 
     def _set_state(self, next_state: BotState, state_path: list[str] | None = None):
@@ -150,6 +168,7 @@ class Controller:
                     transcript = self._asr.transcribe(utterance.samples)
                 result.asr_ms = asr_timer.elapsed_ms
                 result.transcript = transcript
+                logger.info("ASR output: %s", transcript if transcript else "(empty)")
                 if not transcript:
                     result.status = "empty_transcript"
                 result.state_path = tuple(state_path)
@@ -192,17 +211,16 @@ class Controller:
                     transcript = self._asr.transcribe(utterance.samples)
                 result.asr_ms = asr_timer.elapsed_ms
                 result.transcript = transcript
+                logger.info("ASR output: %s", transcript if transcript else "(empty)")
                 if not transcript:
                     result.status = "empty_transcript"
                 else:
-                    self._set_state(BotState.PROCESSING_LLM, state_path)
-                    with Timer() as llm_timer:
-                        reply = self._llm.generate(transcript).strip()
-                    result.llm_ms = llm_timer.elapsed_ms
+                    reply = self._reply_for_transcript(transcript, result, state_path)
                     result.reply = reply
                     if not reply:
                         result.status = "empty_reply"
                     else:
+                        self._llm.remember_turn(transcript, reply)
                         self._set_state(BotState.PROCESSING_TTS, state_path)
                         with Timer() as tts_timer:
                             synthesized = self._tts.synthesize(reply)
@@ -217,6 +235,7 @@ class Controller:
                                     synthesized.samples,
                                     sample_rate=synthesized.sample_rate,
                                 )
+                                result.playback_ms = playback_timer.elapsed_ms
                             result.playback_ms = playback_timer.elapsed_ms
             except Exception as exc:
                 self._set_state(BotState.ERROR, state_path)
@@ -232,13 +251,130 @@ class Controller:
 
         return result
 
+    def _reply_for_transcript(
+        self,
+        transcript: str,
+        result: TurnResult,
+        state_path: list[str],
+    ) -> str:
+        if self._pending_tool_call is not None:
+            return self._handle_pending_confirmation(transcript, result, state_path)
+
+        planner_prompt = build_tool_planner_prompt(
+            assistant_name=self.config.llm.assistant_name,
+            persona_style=self.config.llm.persona_style,
+            max_sentences=self.config.llm.max_sentences,
+            tool_specs=self._tool_registry.specs_for_prompt(),
+        )
+        self._set_state(BotState.PLANNING, state_path)
+        with Timer() as planner_timer:
+            decision = self._llm.plan_turn(transcript, planner_prompt)
+        result.llm_ms += planner_timer.elapsed_ms
+
+        if decision.is_tool_call:
+            return self._handle_tool_call(
+                ToolCall(tool_name=decision.tool_name, arguments=decision.arguments),
+                result,
+                state_path,
+            )
+
+        reply = decision.spoken_response.strip()
+        if reply:
+            return reply
+
+        self._set_state(BotState.PROCESSING_LLM, state_path)
+        with Timer() as llm_timer:
+            reply = self._llm.generate(transcript, remember=False).strip()
+        result.llm_ms += llm_timer.elapsed_ms
+        return reply
+
+    def _handle_tool_call(
+        self,
+        tool_call: ToolCall,
+        result: TurnResult,
+        state_path: list[str],
+    ) -> str:
+        result.tool_name = tool_call.tool_name
+        result.tool_args = dict(tool_call.arguments)
+
+        definition = self._tool_registry.get(tool_call.tool_name)
+        if definition is None:
+            result.status = "tool_error"
+            result.tool_status = "error"
+            return "I do not have a matching tool for that yet."
+
+        if definition.side_effect:
+            self._pending_tool_call = tool_call
+            result.status = "confirmation_required"
+            result.confirmation_required = True
+            result.tool_status = "pending_confirmation"
+            self._set_state(BotState.CONFIRMING_ACTION, state_path)
+            return self._build_confirmation_prompt(tool_call)
+
+        return self._execute_tool_call(tool_call, result, state_path)
+
+    def _execute_tool_call(
+        self,
+        tool_call: ToolCall,
+        result: TurnResult,
+        state_path: list[str],
+    ) -> str:
+        self._set_state(BotState.EXECUTING_TOOL, state_path)
+        with Timer() as tool_timer:
+            tool_result = self._tool_executor.execute(tool_call)
+        result.tool_ms += tool_timer.elapsed_ms
+        result.tool_name = tool_result.tool_name or tool_call.tool_name
+        result.tool_args = dict(tool_call.arguments)
+        result.tool_status = "ok" if tool_result.ok else "error"
+        result.tool_result = tool_result.data
+        if not tool_result.ok:
+            result.status = "tool_error"
+        return tool_result.spoken_response
+
+    def _handle_pending_confirmation(
+        self,
+        transcript: str,
+        result: TurnResult,
+        state_path: list[str],
+    ) -> str:
+        pending_tool_call = self._pending_tool_call
+        if pending_tool_call is None:
+            return ""
+
+        result.tool_name = pending_tool_call.tool_name
+        result.tool_args = dict(pending_tool_call.arguments)
+        result.confirmation_required = True
+
+        if _NEGATIVE_RE.search(transcript):
+            self._pending_tool_call = None
+            result.status = "cancelled"
+            result.tool_status = "cancelled"
+            self._set_state(BotState.CONFIRMING_ACTION, state_path)
+            return "Okay, I will leave that unchanged."
+
+        if _AFFIRMATIVE_RE.search(transcript):
+            self._pending_tool_call = None
+            return self._execute_tool_call(pending_tool_call, result, state_path)
+
+        self._set_state(BotState.CONFIRMING_ACTION, state_path)
+        result.status = "confirmation_required"
+        result.tool_status = "pending_confirmation"
+        return "Please say yes to continue or no to cancel."
+
+    def _build_confirmation_prompt(self, tool_call: ToolCall) -> str:
+        if tool_call.tool_name == "set_output_volume":
+            volume_percent = tool_call.arguments.get("volume_percent")
+            if volume_percent is not None:
+                return f"Do you want me to set the output volume to {volume_percent} percent?"
+        return "Do you want me to go ahead with that?"
+
     def _speak_greeting(self):
         """Generate and speak a short greeting when the bot comes online."""
         greeting_prompt = build_greeting_prompt(
             assistant_name=self.config.llm.assistant_name,
             persona_style=self.config.llm.persona_style,
         )
-        greeting = self._llm.generate(greeting_prompt)
+        greeting = self._llm.generate(greeting_prompt, remember=False)
         if greeting:
             logger.info("Greeting: %s", greeting)
             synthesized = self._tts.synthesize(greeting)
@@ -268,19 +404,33 @@ class Controller:
         vad_end = "-"
         if result.utterance is not None:
             vad_end = result.utterance.to_log_dict()["ended_at_iso"]
+        assistant_name = result.assistant_name or self.config.llm.assistant_name
+        transcript = truncate_for_log(result.transcript)
+        reply = truncate_for_log(result.reply)
         logger.info(
-            "turn=%03d name=%s tts=%s status=%s utterance=%.0fms vad_end=%s asr=%.0fms llm=%.0fms tts=%.0fms total=%.0fms text=\"%s\" reply=\"%s\"%s",
+            "Turn %03d | %s | %s | status=%s | timing: utt=%4.0fms asr=%4.0fms llm=%4.0fms tool=%4.0fms tts=%4.0fms playback=%4.0fms total=%4.0fms | vad_end=%s | ASR=%s | reply=%s",
             result.turn_id,
-            result.assistant_name or self.config.llm.assistant_name,
+            assistant_name,
             result.tts_backend or self._tts.describe(),
             result.status,
             utterance_duration_ms,
-            vad_end,
             result.asr_ms,
             result.llm_ms,
+            result.tool_ms,
             result.tts_ms,
+            result.playback_ms,
             result.total_ms,
-            truncate_for_log(result.transcript),
-            truncate_for_log(result.reply),
-            f" error=\"{truncate_for_log(result.error)}\"" if result.error else "",
+            vad_end,
+            transcript if transcript else "(no speech)",
+            reply if reply else "(none)",
         )
+        if result.tool_name:
+            logger.info(
+                "  tool=%s status=%s confirm=%s args=%s",
+                result.tool_name,
+                result.tool_status or "-",
+                result.confirmation_required,
+                truncate_for_log(str(result.tool_args)),
+            )
+        if result.error:
+            logger.warning("  error=%s", truncate_for_log(result.error))
