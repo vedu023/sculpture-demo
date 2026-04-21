@@ -5,6 +5,7 @@ import unittest
 
 from app.audio.output import AudioOutput
 from app.config import AppConfig
+from app.tools.calendar import parse_calendar_output
 from app.tools.builtin import build_builtin_tool_registry
 
 
@@ -23,7 +24,11 @@ class BuiltinToolTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(result.data["llm_model"], config.llm.model_name)
-        self.assertEqual(result.data["asr_model"], config.asr.model_name)
+        self.assertEqual(result.data["asr_backend"], "auto")
+        self.assertEqual(
+            result.data["asr_model"],
+            f"{config.asr.indic_model_name} (hi/kn auto) with {config.asr.model_name} as English fallback",
+        )
         self.assertEqual(result.data["output_volume_percent"], 35)
         self.assertIn("35 percent", result.spoken_response)
 
@@ -63,3 +68,47 @@ class BuiltinToolTests(unittest.TestCase):
         self.assertEqual(result.data["count"], 3)
         self.assertIn("Built-in Mic", result.spoken_response)
         self.assertIn("USB Headset", result.spoken_response)
+
+    def test_calendar_tool_summarizes_next_event(self):
+        config = AppConfig()
+        speaker = AudioOutput()
+        registry = build_builtin_tool_registry(
+            config,
+            speaker,
+            device_provider=lambda: [],
+            now_provider=lambda: datetime(2026, 4, 17, 9, 30, tzinfo=timezone.utc),
+            calendar_provider=lambda date_scope: [
+                {
+                    "calendar_name": "Work",
+                    "title": "Team Sync",
+                    "start_text": "2026-04-17 10:00",
+                    "end_text": "2026-04-17 10:30",
+                    "location": "",
+                },
+                {
+                    "calendar_name": "Work",
+                    "title": "Design Review",
+                    "start_text": "2026-04-17 13:00",
+                    "end_text": "2026-04-17 14:00",
+                    "location": "",
+                },
+            ],
+        )
+
+        result = registry.get("get_calendar_events").handler({"date_scope": "today", "mode": "next"})
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["count"], 2)
+        self.assertEqual(result.data["date_scope"], "today")
+        self.assertIn("Team Sync", result.spoken_response)
+        self.assertIn("10:00 AM", result.spoken_response)
+
+    def test_parse_calendar_output_reads_tab_separated_lines(self):
+        parsed = parse_calendar_output(
+            "Work\tTeam Sync\t2026-04-17 10:00\t2026-04-17 10:30\tRoom A\n"
+            "Personal\tLunch\t2026-04-17 12:00\t2026-04-17 13:00\t\n"
+        )
+
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0]["title"], "Team Sync")
+        self.assertEqual(parsed[1]["calendar_name"], "Personal")

@@ -42,6 +42,8 @@ class ToolDefinition:
     parameters: dict[str, str]
     side_effect: bool
     handler: ToolHandler
+    parameter_schema: dict[str, dict[str, Any]] = field(default_factory=dict)
+    required_parameters: tuple[str, ...] = ()
 
     def to_prompt_spec(self) -> dict[str, Any]:
         return {
@@ -49,4 +51,29 @@ class ToolDefinition:
             "description": self.description,
             "parameters": dict(self.parameters),
             "side_effect": self.side_effect,
+        }
+
+    def to_ollama_tool(self) -> dict[str, Any]:
+        properties = self.parameter_schema or {
+            key: {
+                "type": "string",
+                "description": value,
+            }
+            for key, value in self.parameters.items()
+        }
+        schema: dict[str, Any] = {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": False,
+        }
+        required_parameters = list(self.required_parameters)
+        if required_parameters:
+            schema["required"] = required_parameters
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": schema,
+            },
         }

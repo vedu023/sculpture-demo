@@ -15,3 +15,9 @@ class ToolRegistry:
             self._definitions[name].to_prompt_spec()
             for name in sorted(self._definitions)
         ]
+
+    def ollama_tools(self) -> list[dict[str, object]]:
+        return [
+            self._definitions[name].to_ollama_tool()
+            for name in sorted(self._definitions)
+        ]
