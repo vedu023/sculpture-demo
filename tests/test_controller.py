@@ -12,6 +12,10 @@ from app.tools.types import ToolDecision, ToolDefinition, ToolResult
 from app.types import CapturedUtterance, SynthesizedAudio
 
 
+def no_route(*args, **kwargs):
+    return None
+
+
 class FakeCaptureSession:
     def __init__(self, utterances: CapturedUtterance | list[CapturedUtterance]):
         if isinstance(utterances, list):
@@ -61,11 +65,12 @@ class FakeLLM:
         self.plan_calls: list[tuple[str, str]] = []
         self.generated_calls: list[tuple[str, bool]] = []
         self.remembered: list[tuple[str, str]] = []
+        self.system_prompts: list[str] = []
 
     def warmup(self):
         self.warmed = True
 
-    def plan_turn(self, user_text: str, planner_prompt: str):
+    def plan_turn(self, user_text: str, planner_prompt: str, tool_schemas=None):
         self.plan_calls.append((user_text, planner_prompt))
         if self.decisions:
             return self.decisions.pop(0)
@@ -75,6 +80,18 @@ class FakeLLM:
         self.generated_calls.append((user_text, remember))
         return self.generated_reply
 
+    def generate_with_system_prompt(
+        self,
+        *,
+        system_prompt: str,
+        user_text: str,
+        remember: bool = False,
+        fallback_reply: str = "",
+    ):
+        self.system_prompts.append(system_prompt)
+        self.generated_calls.append((user_text, remember))
+        return self.generated_reply or fallback_reply
+
     def remember_turn(self, user_text: str, assistant_text: str):
         self.remembered.append((user_text, assistant_text))
 
@@ -83,14 +100,20 @@ class FakeTTS:
     def __init__(self, audio: SynthesizedAudio):
         self.audio = audio
         self.warmed = False
+        self.synth_calls: list[tuple[str, str]] = []
 
     def warmup(self):
         self.warmed = True
 
-    def synthesize(self, text: str):
+    def synthesize(self, text: str, language: str = "en"):
+        self.synth_calls.append((text, language))
         return self.audio
 
-    def describe(self) -> str:
+    def describe(self, language: str | None = None) -> str:
+        if language is None:
+            return "auto(pocket_tts/alba, spark_somya_tts/Spark_somya_TTS)"
+        if language in {"hi", "kn"}:
+            return "spark_somya_tts/Spark_somya_TTS"
         return "pocket_tts/alba"
 
 
@@ -174,6 +197,7 @@ class ControllerTests(unittest.TestCase):
             tts=make_tts(),
             speaker=speaker,
             session_logger=logger,
+            tool_router=no_route,
         )
 
         with controller:
@@ -226,6 +250,7 @@ class ControllerTests(unittest.TestCase):
             session_logger=logger,
             tool_registry=tool_registry,
             tool_executor=tool_executor,
+            tool_router=no_route,
         )
 
         with controller:
@@ -249,6 +274,97 @@ class ControllerTests(unittest.TestCase):
                 "LISTENING",
             ),
         )
+
+    def test_run_turn_localizes_tool_reply_for_hindi(self):
+        logger = FakeSessionLogger()
+        speaker = FakeSpeaker()
+        llm = FakeLLM(
+            decisions=[ToolDecision(decision="tool_call", tool_name="get_time")]
+        )
+        handler = RecordingToolHandler(
+            lambda arguments: ToolResult(
+                tool_name="get_time",
+                ok=True,
+                data={"time": "9:41 AM"},
+                spoken_response="It is 9:41 AM.",
+            )
+        )
+        tool_registry, tool_executor = make_tooling("get_time", False, handler)
+        tts = make_tts()
+        controller = Controller(
+            AppConfig(),
+            capture_session=FakeCaptureSession(make_utterance()),
+            asr=FakeASR("अभी समय क्या है"),
+            llm=llm,
+            tts=tts,
+            speaker=speaker,
+            session_logger=logger,
+            tool_registry=tool_registry,
+            tool_executor=tool_executor,
+            tool_router=no_route,
+        )
+
+        with controller:
+            result = controller.run_turn(play_audio=True)
+
+        self.assertEqual(result.reply_language, "hi")
+        self.assertEqual(result.reply, "अभी 9:41 AM बजे हैं।")
+        self.assertEqual(result.tts_backend, "spark_somya_tts/Spark_somya_TTS")
+        self.assertEqual(tts.synth_calls[-1][1], "hi")
+
+    def test_english_mode_keeps_reply_language_in_english(self):
+        logger = FakeSessionLogger()
+        speaker = FakeSpeaker()
+        config = AppConfig()
+        config.asr.language_mode = "english"
+        llm = FakeLLM(
+            decisions=[ToolDecision(decision="speak", spoken_response="short reply")]
+        )
+        tts = make_tts()
+        controller = Controller(
+            config,
+            capture_session=FakeCaptureSession(make_utterance()),
+            asr=FakeASR("नमस्ते"),
+            llm=llm,
+            tts=tts,
+            speaker=speaker,
+            session_logger=logger,
+            tool_router=no_route,
+        )
+
+        with controller:
+            result = controller.run_turn(play_audio=True)
+
+        self.assertEqual(result.reply_language, "en")
+        self.assertEqual(result.tts_backend, "pocket_tts/alba")
+        self.assertEqual(tts.synth_calls[-1][1], "en")
+
+    def test_indic_mode_keeps_reply_language_inside_indic_family(self):
+        logger = FakeSessionLogger()
+        speaker = FakeSpeaker()
+        config = AppConfig()
+        config.asr.language_mode = "indic"
+        llm = FakeLLM(
+            decisions=[ToolDecision(decision="speak", spoken_response="short reply")]
+        )
+        tts = make_tts()
+        controller = Controller(
+            config,
+            capture_session=FakeCaptureSession(make_utterance()),
+            asr=FakeASR("namaskara"),
+            llm=llm,
+            tts=tts,
+            speaker=speaker,
+            session_logger=logger,
+            tool_router=no_route,
+        )
+
+        with controller:
+            result = controller.run_turn(play_audio=True)
+
+        self.assertEqual(result.reply_language, "hi")
+        self.assertEqual(result.tts_backend, "spark_somya_tts/Spark_somya_TTS")
+        self.assertEqual(tts.synth_calls[-1][1], "hi")
 
     def test_side_effect_tool_requires_confirmation_then_executes_on_yes(self):
         logger = FakeSessionLogger()
@@ -282,6 +398,7 @@ class ControllerTests(unittest.TestCase):
             session_logger=logger,
             tool_registry=tool_registry,
             tool_executor=tool_executor,
+            tool_router=no_route,
         )
 
         with controller:
@@ -336,6 +453,7 @@ class ControllerTests(unittest.TestCase):
             tts=make_tts(),
             speaker=speaker,
             session_logger=logger,
+            tool_router=no_route,
         )
 
         with controller:
@@ -358,6 +476,7 @@ class ControllerTests(unittest.TestCase):
             tts=make_tts(),
             speaker=FakeSpeaker(),
             session_logger=logger,
+            tool_router=no_route,
         )
 
         with self.assertLogs("app.orchestration.controller", level="INFO") as captured:
@@ -365,4 +484,4 @@ class ControllerTests(unittest.TestCase):
 
         combined = "\n".join(captured.output)
         self.assertIn("Smruti", combined)
-        self.assertIn("pocket_tts/alba", combined)
+        self.assertIn("auto(", combined)

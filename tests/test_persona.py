@@ -17,7 +17,8 @@ class PersonaTests(unittest.TestCase):
         config = LLMConfig()
         self.assertIn("Smruti", config.system_prompt)
         self.assertIn("warm", config.system_prompt)
-        self.assertEqual(config.max_tokens, 128)
+        self.assertEqual(config.model_name, "gemma4:e4b")
+        self.assertEqual(config.max_tokens, 100)
 
     def test_prompt_prefers_short_spoken_sentences(self):
         config = LLMConfig()
@@ -27,3 +28,7 @@ class PersonaTests(unittest.TestCase):
         prompt = build_greeting_prompt("Smruti", "smruti")
         self.assertIn("Smruti", prompt)
         self.assertIn("one short sentence", prompt)
+
+    def test_prompt_can_force_hindi_reply(self):
+        prompt = build_system_prompt("Smruti", "smruti", 2, reply_language="hi")
+        self.assertIn("Hindi", prompt)

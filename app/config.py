@@ -30,19 +30,22 @@ class VADConfig:
 
 @dataclass
 class ASRConfig:
+    backend: str = "auto"
     model_name: str = "small.en"
+    indic_model_name: str = "somyalab/Vyasa_mini_rnnt_onnx_v2"
+    language_mode: str = "auto"
     device: str = "cpu"
     compute_type: str = "float32"
     beam_size: int = 2
     fallback_beam_size: int = 2
-    language: str = "en"
+    language: str = "auto"
     condition_on_previous_text: bool = False
 
 
 @dataclass
 class LLMConfig:
-    model_name: str = "qwen3:14b"
-    max_tokens: int = 128
+    model_name: str = "gemma4:e4b"
+    max_tokens: int = 100
     max_sentences: int = 2
     max_history_turns: int = 10
     assistant_name: str = "Smruti"
@@ -59,12 +62,17 @@ class LLMConfig:
 
 @dataclass
 class TTSConfig:
-    backend: str = "pocket_tts"
+    backend: str = "auto"
     device: str = "cpu"
     audio_prompt_path: Path = field(default_factory=lambda: PROJECT_ROOT / "voice_ref_clean.wav")
     voice_state_path: Path = field(default_factory=lambda: PROJECT_ROOT / "voice_ref_clean.safetensors")
     pocket_voice: str = "alba"
     pocket_speed: float = 1.0
+    spark_model_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "models" / "Spark_somya_TTS")
+    spark_repo_id: str = "somyalab/Spark_somya_TTS"
+    spark_temperature: float = 0.7
+    spark_top_k: int = 50
+    spark_top_p: float = 0.95
 
 
 @dataclass

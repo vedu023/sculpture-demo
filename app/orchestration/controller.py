@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
 
 from app.asr.engine import ASREngine
@@ -9,11 +8,26 @@ from app.audio.capture import CaptureSession
 from app.audio.output import AudioOutput
 from app.audio.save import save_utterance
 from app.config import AppConfig
+from app.language import (
+    confirmation_cancelled,
+    confirmation_prompt,
+    confirmation_retry,
+    default_reply_language,
+    detect_text_language,
+    fallback_reply,
+    greeting_fallback,
+    is_affirmative,
+    is_mixed_indic_script,
+    is_negative,
+    localize_tool_result,
+    normalize_language_mode,
+)
 from app.llm.engine import LLMEngine
-from app.persona import build_greeting_prompt, build_tool_planner_prompt
+from app.persona import build_greeting_prompt, build_system_prompt, build_tool_planner_prompt
 from app.state import BotState
 from app.tools.builtin import build_builtin_tool_registry
 from app.tools.executor import ToolExecutor
+from app.tools.router import route_tool_intent
 from app.tools.types import ToolCall
 from app.tts.engine import TTSEngine
 from app.types import CapturedUtterance, TurnResult
@@ -22,8 +36,6 @@ from app.utils.text import truncate_for_log
 from app.utils.timers import Timer
 
 logger = logging.getLogger(__name__)
-_AFFIRMATIVE_RE = re.compile(r"\b(?:yes|yeah|yep|sure|okay|ok|confirm|go ahead|do it|please do)\b", re.IGNORECASE)
-_NEGATIVE_RE = re.compile(r"\b(?:no|nope|cancel|stop|do not|don't|never mind)\b", re.IGNORECASE)
 
 
 class Controller:
@@ -40,12 +52,16 @@ class Controller:
         session_logger: SessionLogger | None = None,
         tool_registry=None,
         tool_executor: ToolExecutor | None = None,
+        tool_router=None,
     ):
         self.config = config
         self.state = BotState.LISTENING
         self._capture = capture_session or CaptureSession(config)
         self._asr = asr or ASREngine(
+            backend=config.asr.backend,
             model_name=config.asr.model_name,
+            indic_model_name=config.asr.indic_model_name,
+            language_mode=config.asr.language_mode,
             device=config.asr.device,
             compute_type=config.asr.compute_type,
             beam_size=config.asr.beam_size,
@@ -64,8 +80,14 @@ class Controller:
             backend=config.tts.backend,
             voice=config.tts.pocket_voice,
             speed=config.tts.pocket_speed,
+            device=config.tts.device,
             audio_prompt_path=config.tts.audio_prompt_path,
             voice_state_path=config.tts.voice_state_path,
+            spark_model_dir=config.tts.spark_model_dir,
+            spark_repo_id=config.tts.spark_repo_id,
+            spark_temperature=config.tts.spark_temperature,
+            spark_top_k=config.tts.spark_top_k,
+            spark_top_p=config.tts.spark_top_p,
         )
         self._speaker = speaker or AudioOutput(
             default_sample_rate=config.audio.sample_rate,
@@ -73,10 +95,15 @@ class Controller:
         )
         self._tool_registry = tool_registry or build_builtin_tool_registry(config, self._speaker)
         self._tool_executor = tool_executor or ToolExecutor(self._tool_registry)
+        self._tool_router = tool_router or route_tool_intent
         self._session_logger = session_logger or SessionLogger(config.logs_dir, "chat")
         self._turn_counter = 0
         self._started = False
         self._pending_tool_call: ToolCall | None = None
+        self._last_reply_language = default_reply_language(
+            config.asr.language,
+            config.asr.language_mode,
+        )
 
     def __enter__(self):
         self.start()
@@ -215,15 +242,18 @@ class Controller:
                 if not transcript:
                     result.status = "empty_transcript"
                 else:
-                    reply = self._reply_for_transcript(transcript, result, state_path)
+                    reply_language = self._detect_reply_language(transcript)
+                    result.reply_language = reply_language
+                    reply = self._reply_for_transcript(transcript, reply_language, result, state_path)
                     result.reply = reply
                     if not reply:
                         result.status = "empty_reply"
                     else:
                         self._llm.remember_turn(transcript, reply)
                         self._set_state(BotState.PROCESSING_TTS, state_path)
+                        result.tts_backend = self._tts.describe(reply_language)
                         with Timer() as tts_timer:
-                            synthesized = self._tts.synthesize(reply)
+                            synthesized = self._tts.synthesize(reply, language=reply_language)
                         result.tts_ms = tts_timer.elapsed_ms
                         result.synthesized_audio = synthesized
                         if synthesized.samples.size == 0:
@@ -254,26 +284,45 @@ class Controller:
     def _reply_for_transcript(
         self,
         transcript: str,
+        reply_language: str,
         result: TurnResult,
         state_path: list[str],
     ) -> str:
         if self._pending_tool_call is not None:
-            return self._handle_pending_confirmation(transcript, result, state_path)
+            return self._handle_pending_confirmation(transcript, reply_language, result, state_path)
+
+        self._set_state(BotState.PLANNING, state_path)
+        current_volume_percent = None
+        if hasattr(self._speaker, "get_volume_percent"):
+            current_volume_percent = self._speaker.get_volume_percent()
+        routed_tool_call = self._tool_router(
+            transcript,
+            self._tool_registry,
+            current_volume_percent=current_volume_percent,
+        )
+        if routed_tool_call is not None:
+            logger.info("Tool router matched transcript to %s", routed_tool_call.tool_name)
+            return self._handle_tool_call(routed_tool_call, reply_language, result, state_path)
 
         planner_prompt = build_tool_planner_prompt(
             assistant_name=self.config.llm.assistant_name,
             persona_style=self.config.llm.persona_style,
             max_sentences=self.config.llm.max_sentences,
             tool_specs=self._tool_registry.specs_for_prompt(),
+            reply_language=reply_language,
         )
-        self._set_state(BotState.PLANNING, state_path)
         with Timer() as planner_timer:
-            decision = self._llm.plan_turn(transcript, planner_prompt)
+            decision = self._llm.plan_turn(
+                transcript,
+                planner_prompt,
+                tool_schemas=self._tool_registry.ollama_tools(),
+            )
         result.llm_ms += planner_timer.elapsed_ms
 
         if decision.is_tool_call:
             return self._handle_tool_call(
                 ToolCall(tool_name=decision.tool_name, arguments=decision.arguments),
+                reply_language,
                 result,
                 state_path,
             )
@@ -283,14 +332,26 @@ class Controller:
             return reply
 
         self._set_state(BotState.PROCESSING_LLM, state_path)
+        system_prompt = build_system_prompt(
+            assistant_name=self.config.llm.assistant_name,
+            persona_style=self.config.llm.persona_style,
+            max_sentences=self.config.llm.max_sentences,
+            reply_language=reply_language,
+        )
         with Timer() as llm_timer:
-            reply = self._llm.generate(transcript, remember=False).strip()
+            reply = self._llm.generate_with_system_prompt(
+                system_prompt=system_prompt,
+                user_text=transcript,
+                remember=False,
+                fallback_reply=fallback_reply(reply_language),
+            ).strip()
         result.llm_ms += llm_timer.elapsed_ms
         return reply
 
     def _handle_tool_call(
         self,
         tool_call: ToolCall,
+        reply_language: str,
         result: TurnResult,
         state_path: list[str],
     ) -> str:
@@ -301,6 +362,10 @@ class Controller:
         if definition is None:
             result.status = "tool_error"
             result.tool_status = "error"
+            if reply_language == "hi":
+                return "मेरे पास उसके लिए सही टूल अभी नहीं है।"
+            if reply_language == "kn":
+                return "ಅದಕ್ಕೆ ತಕ್ಕ ಟೂಲ್ ಈಗ ನನ್ನ ಬಳಿ ಇಲ್ಲ."
             return "I do not have a matching tool for that yet."
 
         if definition.side_effect:
@@ -309,13 +374,14 @@ class Controller:
             result.confirmation_required = True
             result.tool_status = "pending_confirmation"
             self._set_state(BotState.CONFIRMING_ACTION, state_path)
-            return self._build_confirmation_prompt(tool_call)
+            return self._build_confirmation_prompt(tool_call, reply_language)
 
-        return self._execute_tool_call(tool_call, result, state_path)
+        return self._execute_tool_call(tool_call, reply_language, result, state_path)
 
     def _execute_tool_call(
         self,
         tool_call: ToolCall,
+        reply_language: str,
         result: TurnResult,
         state_path: list[str],
     ) -> str:
@@ -329,11 +395,12 @@ class Controller:
         result.tool_result = tool_result.data
         if not tool_result.ok:
             result.status = "tool_error"
-        return tool_result.spoken_response
+        return localize_tool_result(tool_result, reply_language)
 
     def _handle_pending_confirmation(
         self,
         transcript: str,
+        reply_language: str,
         result: TurnResult,
         state_path: list[str],
     ) -> str:
@@ -345,39 +412,45 @@ class Controller:
         result.tool_args = dict(pending_tool_call.arguments)
         result.confirmation_required = True
 
-        if _NEGATIVE_RE.search(transcript):
+        if is_negative(transcript):
             self._pending_tool_call = None
             result.status = "cancelled"
             result.tool_status = "cancelled"
             self._set_state(BotState.CONFIRMING_ACTION, state_path)
-            return "Okay, I will leave that unchanged."
+            return confirmation_cancelled(reply_language)
 
-        if _AFFIRMATIVE_RE.search(transcript):
+        if is_affirmative(transcript):
             self._pending_tool_call = None
-            return self._execute_tool_call(pending_tool_call, result, state_path)
+            return self._execute_tool_call(pending_tool_call, reply_language, result, state_path)
 
         self._set_state(BotState.CONFIRMING_ACTION, state_path)
         result.status = "confirmation_required"
         result.tool_status = "pending_confirmation"
-        return "Please say yes to continue or no to cancel."
+        return confirmation_retry(reply_language)
 
-    def _build_confirmation_prompt(self, tool_call: ToolCall) -> str:
-        if tool_call.tool_name == "set_output_volume":
-            volume_percent = tool_call.arguments.get("volume_percent")
-            if volume_percent is not None:
-                return f"Do you want me to set the output volume to {volume_percent} percent?"
-        return "Do you want me to go ahead with that?"
+    def _build_confirmation_prompt(self, tool_call: ToolCall, reply_language: str) -> str:
+        return confirmation_prompt(tool_call, reply_language)
 
     def _speak_greeting(self):
         """Generate and speak a short greeting when the bot comes online."""
+        reply_language = default_reply_language(
+            self.config.asr.language,
+            self.config.asr.language_mode,
+        )
         greeting_prompt = build_greeting_prompt(
             assistant_name=self.config.llm.assistant_name,
             persona_style=self.config.llm.persona_style,
+            reply_language=reply_language,
         )
-        greeting = self._llm.generate(greeting_prompt, remember=False)
+        greeting = self._llm.generate_with_system_prompt(
+            system_prompt=greeting_prompt,
+            user_text="Greet the audience now.",
+            remember=False,
+            fallback_reply=greeting_fallback(reply_language),
+        )
         if greeting:
             logger.info("Greeting: %s", greeting)
-            synthesized = self._tts.synthesize(greeting)
+            synthesized = self._tts.synthesize(greeting, language=reply_language)
             if synthesized.samples.size > 0:
                 self._speaker.play(synthesized.samples, sample_rate=synthesized.sample_rate)
 
@@ -434,3 +507,22 @@ class Controller:
             )
         if result.error:
             logger.warning("  error=%s", truncate_for_log(result.error))
+
+    def _detect_reply_language(self, transcript: str) -> str:
+        language_mode = normalize_language_mode(self.config.asr.language_mode)
+        if language_mode == "english":
+            self._last_reply_language = "en"
+            return "en"
+
+        configured_language = self.config.asr.language
+        fallback_language = default_reply_language(configured_language, language_mode)
+        if is_mixed_indic_script(transcript):
+            if language_mode == "indic" and self._last_reply_language not in {"hi", "kn"}:
+                self._last_reply_language = fallback_language
+            return self._last_reply_language
+        detected_language = detect_text_language(transcript, default=fallback_language)
+        if language_mode == "indic" and detected_language not in {"hi", "kn"}:
+            return self._last_reply_language
+        if detected_language in {"hi", "kn"}:
+            self._last_reply_language = detected_language
+        return detected_language

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.language import language_instruction
+
 
 PERSONA_STYLE_PROMPTS = {
     "smruti": (
@@ -53,11 +55,13 @@ def build_system_prompt(
     assistant_name: str,
     persona_style: str,
     max_sentences: int,
+    reply_language: str = "en",
 ) -> str:
     persona_prompt = PERSONA_STYLE_PROMPTS.get(persona_style, PERSONA_STYLE_PROMPTS["neutral"])
     return (
         f"You are {assistant_name}, a voice assistant built for live conversation. "
         f"{persona_prompt} "
+        f"{language_instruction(reply_language)} "
         f"Reply in at most {max_sentences} short spoken sentences. Prefer one sentence when possible. "
         "Never use markdown, bullet points, lists, or long explanations. "
         "Speak naturally — as if talking out loud to someone standing in front of you."
@@ -67,10 +71,11 @@ def build_system_prompt(
 def build_greeting_prompt(
     assistant_name: str,
     persona_style: str,
+    reply_language: str = "en",
 ) -> str:
     greeting = GREETING_PROMPTS.get(persona_style, GREETING_PROMPTS["neutral"])
     return (
-        f"You are {assistant_name}. {greeting} "
+        f"You are {assistant_name}. {language_instruction(reply_language)} {greeting} "
         "Reply with exactly one short sentence. No markdown."
     )
 
@@ -80,12 +85,14 @@ def build_tool_planner_prompt(
     persona_style: str,
     max_sentences: int,
     tool_specs: list[dict[str, object]],
+    reply_language: str = "en",
 ) -> str:
     persona_prompt = PERSONA_STYLE_PROMPTS.get(persona_style, PERSONA_STYLE_PROMPTS["neutral"])
     tool_list = _format_tool_specs(tool_specs)
     return (
         f"You are {assistant_name}, a voice assistant built for live conversation. "
         f"{persona_prompt} "
+        f"{language_instruction(reply_language)} "
         "Decide whether to answer directly or call exactly one tool. "
         f"If you answer directly, keep it to at most {max_sentences} short spoken sentences. "
         "If you need a tool, do not fake the result. Return a tool call instead. "
@@ -96,5 +103,9 @@ def build_tool_planner_prompt(
         'For "tool_call", leave spoken_response empty, set tool_name, and provide arguments as a JSON object. '
         "requires_confirmation must be true only for actions that change settings or state. "
         "Do not add markdown, code fences, or extra text outside the JSON object. "
+        "Examples: "
+        '{"decision":"tool_call","spoken_response":"","tool_name":"get_time","arguments":{},"requires_confirmation":false} '
+        '{"decision":"tool_call","spoken_response":"","tool_name":"set_output_volume","arguments":{"volume_percent":40},"requires_confirmation":true} '
+        '{"decision":"speak","spoken_response":"Hey, nice to meet you.","tool_name":"","arguments":{},"requires_confirmation":false} '
         f"Available tools:\n{tool_list}"
     )

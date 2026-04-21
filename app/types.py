@@ -61,6 +61,7 @@ class TurnResult:
     status: str
     assistant_name: str = ""
     tts_backend: str = ""
+    reply_language: str = ""
     transcript: str = ""
     reply: str = ""
     utterance: CapturedUtterance | None = None
@@ -86,6 +87,7 @@ class TurnResult:
             "status": self.status,
             "assistant_name": self.assistant_name,
             "tts_backend": self.tts_backend,
+            "reply_language": self.reply_language,
             "transcript": self.transcript,
             "reply": self.reply,
             "capture_ms": round(self.capture_ms, 1),
