@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from app.tts.voice_ref import should_use_cached_voice_state, voice_state_is_stale
 from app.types import SynthesizedAudio
 
 logger = logging.getLogger(__name__)
@@ -41,13 +42,23 @@ class PocketTTSBackend:
         logger.info("Loading Pocket TTS model")
         model = TTSModel.load_model()
 
-        # Priority: cached safetensors > audio prompt > default voice
-        if self._voice_state_path and self._voice_state_path.exists():
+        use_cached_state = should_use_cached_voice_state(
+            self._audio_prompt_path,
+            self._voice_state_path,
+        )
+
+        # Priority: fresh cached safetensors > updated audio prompt > default voice
+        if use_cached_state and self._voice_state_path and self._voice_state_path.exists():
             logger.info("Loading cached voice state from: %s", self._voice_state_path)
             voice_state = model.get_state_for_audio_prompt(
                 audio_conditioning=str(self._voice_state_path)
             )
         elif self._audio_prompt_path and self._audio_prompt_path.exists():
+            if voice_state_is_stale(self._audio_prompt_path, self._voice_state_path):
+                logger.info(
+                    "Voice state cache is stale relative to %s; using the updated WAV until you rerun prepare-voice.",
+                    self._audio_prompt_path,
+                )
             logger.info("Loading custom voice from: %s", self._audio_prompt_path)
             voice_state = model.get_state_for_audio_prompt(
                 audio_conditioning=str(self._audio_prompt_path)
@@ -93,8 +104,8 @@ class PocketTTSBackend:
         )
 
     def describe(self) -> str:
-        if self._voice_state_path and self._voice_state_path.exists():
+        if should_use_cached_voice_state(self._audio_prompt_path, self._voice_state_path):
             return f"{self.backend_name}/{self._voice_state_path.stem}"
-        if self._audio_prompt_path:
+        if self._audio_prompt_path and self._audio_prompt_path.exists():
             return f"{self.backend_name}/{self._audio_prompt_path.stem}"
         return f"{self.backend_name}/{self.voice}"
