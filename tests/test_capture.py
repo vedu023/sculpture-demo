@@ -78,3 +78,22 @@ class SegmenterTests(unittest.TestCase):
         self.assertAlmostEqual(utterance.duration_ms, 96.0, delta=0.5)
         self.assertAlmostEqual(utterance.trailing_silence_ms, 0.0, delta=0.1)
         self.assertEqual(vad.reset_count, 1)
+
+    def test_segmenter_speech_onset_longer_than_preroll(self):
+        vad = FakeVAD([0.9] * 9, min_speech_ms=220, min_silence_ms=64)
+        segmenter = UtteranceSegmenter(
+            vad=vad,
+            sample_rate=16000,
+            block_size=512,
+            preroll_ms=160,
+            max_utterance_ms=192,
+            trim_trailing_silence=False,
+        )
+
+        utterance = None
+        for index in range(8):
+            utterance = segmenter.feed(make_chunk(index))
+            if utterance is not None:
+                break
+
+        self.assertIsNotNone(utterance)

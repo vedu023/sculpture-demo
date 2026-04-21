@@ -37,7 +37,7 @@ class AudioInput:
         return sd.InputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
-            dtype="int16",
+            dtype="float32",
             blocksize=self.block_size,
             device=self.device,
             callback=callback,

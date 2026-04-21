@@ -41,7 +41,7 @@ class AudioCaptureLoop:
         if not self._capture_enabled:
             return
 
-        samples = indata.copy().reshape(-1)
+        samples = np.array(indata, dtype=np.float32, copy=True).reshape(-1)
         ended_at = time.time()
         started_at = ended_at - (len(samples) / self._input.sample_rate)
         chunk = AudioChunk(
@@ -79,8 +79,10 @@ class AudioCaptureLoop:
         if not enabled:
             self.drain()
 
-    def get_chunk(self, timeout: float = 1.0) -> AudioChunk | None:
+    def get_chunk(self, timeout: float | None = None) -> AudioChunk | None:
         try:
+            if timeout is None:
+                return self._queue.get()
             return self._queue.get(timeout=timeout)
         except queue.Empty:
             return None
@@ -154,10 +156,17 @@ class UtteranceSegmenter:
             if self._speech_count >= self._speech_onset_chunks:
                 self._speaking = True
                 self._utterance_chunks = list(self._pre_buffer)
-                self._speech_started_at = self._utterance_chunks[-self._speech_onset_chunks].started_at
+                if not self._utterance_chunks:
+                    self._utterance_chunks = [chunk]
+                speech_start_index = max(
+                    0, len(self._utterance_chunks) - self._speech_onset_chunks
+                )
+                self._speech_started_at = self._utterance_chunks[speech_start_index].started_at
                 self._pre_buffer.clear()
                 self._silence_count = 0
                 logger.debug("Speech started")
+                return None
+
             return None
 
         self._utterance_chunks.append(chunk)
@@ -186,7 +195,11 @@ class UtteranceSegmenter:
             trimmed_chunks = self._utterance_chunks[:1]
 
         speech_end_chunk = trimmed_chunks[-1]
-        samples = np.concatenate([chunk.samples for chunk in trimmed_chunks]).astype(np.int16)
+        utterance_samples = np.concatenate([chunk.samples for chunk in trimmed_chunks])
+        if np.issubdtype(utterance_samples.dtype, np.floating):
+            samples = utterance_samples.astype(np.float32, copy=False)
+        else:
+            samples = (utterance_samples.astype(np.float32, copy=False) / 32768.0)
         duration_ms = len(samples) / self._sample_rate * 1000
         speech_ms = max(0.0, (speech_end_chunk.ended_at - (self._speech_started_at or trimmed_chunks[0].started_at)) * 1000)
         utterance = CapturedUtterance(
@@ -244,7 +257,7 @@ class CaptureSession:
         if self._started:
             return
         self._capture.start()
-        self._vad.get_speech_prob(np.zeros(self._config.audio.block_size, dtype=np.int16))
+        self._vad.get_speech_prob(np.zeros(self._config.audio.block_size, dtype=np.float32))
         self._vad.reset()
         self._started = True
 
@@ -254,7 +267,7 @@ class CaptureSession:
         self._capture.stop()
         self._started = False
 
-    def next_utterance(self, timeout: float = 1.0) -> CapturedUtterance:
+    def next_utterance(self, timeout: float | None = None) -> CapturedUtterance:
         self.start()
         self._segmenter.reset()
         self._capture.drain()
